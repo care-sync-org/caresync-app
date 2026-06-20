@@ -1,0 +1,1 @@
+{"version":3,"file":"ConsoleEventProvider.d.ts","sourceRoot":"","sources":["../../../src/providers/implementations/ConsoleEventProvider.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,aAAa,EAAE,QAAQ,EAAE,MAAM,6BAA6B,CAAC;AAEtE,qBAAa,oBAAqB,YAAW,aAAa;IAClD,OAAO,CAAC,KAAK,EAAE,QAAQ,GAAG,OAAO,CAAC,IAAI,CAAC;IAWvC,YAAY,CAAC,MAAM,EAAE,QAAQ,EAAE,GAAG,OAAO,CAAC,IAAI,CAAC;CAKtD"}

@@ -1,0 +1,173 @@
+name: "CareSync — frontend CI/CD"
+
+on:
+  push:
+    branches: [dev, main]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/ci-cd-frontend.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  SERVICE_NAME: frontend
+  SERVICE_PATH: frontend
+  ECR_REGISTRY: 664685894054.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPO: caresync/frontend
+  AWS_REGION: us-east-1
+  SONAR_PROJECT_KEY: caresync_frontend
+  HELM_VALUES_PATH: helm/values.yaml
+
+jobs:
+  sonarcloud:
+    name: "SonarCloud Analysis"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: frontend
+
+  build-and-snyk:
+    name: "Build and Snyk Scan"
+    needs: sonarcloud
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Dependencies
+        run: |
+          cd frontend
+          npm ci
+
+      - name: Snyk Security Scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: test
+          args: --severity-threshold=high --file=frontend/package.json
+        continue-on-error: true
+
+  docker-build-trivy-push:
+    name: "Docker Build, Trivy Scan, and Push"
+    needs: build-and-snyk
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.set_tag.outputs.image_tag }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set Image Tag
+        id: set_tag
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
+          ENV_NAME=${{ github.ref_name == 'main' && 'prod' || 'dev' }}
+          IMAGE_TAG="${ENV_NAME}-${SHORT_SHA}"
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "Image tag: $IMAGE_TAG"
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+      - name: Build Docker Image locally for Trivy Scan
+        run: |
+          docker build -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.set_tag.outputs.image_tag }} -f frontend/Dockerfile frontend
+
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.set_tag.outputs.image_tag }}'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+        continue-on-error: true
+
+      - name: Push Docker Image to ECR
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.set_tag.outputs.image_tag }}
+          docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.set_tag.outputs.image_tag }} ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:latest
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:latest
+
+  approval-gate:
+    name: "Approval Gate (main only)"
+    needs: docker-build-trivy-push
+    if: github.ref_name == 'main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    environment: production
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for Environment Approval
+        run: echo "Deployment approved by manager in GitHub Actions!"
+
+  update-helm-values:
+    name: "Update GitOps Repo (ArgoCD)"
+    needs: [docker-build-trivy-push, approval-gate]
+    if: |
+      always() &&
+      needs.docker-build-trivy-push.result == 'success' &&
+      (
+        github.ref_name == 'dev' ||
+        (github.ref_name == 'main' && needs.approval-gate.result == 'success')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout GitOps Repository
+        uses: actions/checkout@v4
+        with:
+          repository: care-sync-org/caresync-gitops
+          token: ${{ secrets.MANIFEST_REPO_PAT }}
+          path: gitops-repo
+
+      - name: Update Helm Values using yq
+        run: |
+          cd gitops-repo
+          
+          VALUES_FILE=${{ github.ref_name == 'main' && 'helm/values.yaml' || 'helm/values-dev.yaml' }}
+          
+          if [ "${{ github.ref_name }}" == "dev" ]; then
+            yq e '.services.frontend.tag = "${{ needs.docker-build-trivy-push.outputs.image_tag }}"' -i helm/values-dev.yaml
+          else
+            yq e '.services.frontend.tag = "${{ needs.docker-build-trivy-push.outputs.image_tag }}"' -i helm/values.yaml
+          fi
+
+      - name: Commit and Push Changes to GitOps Repo
+        run: |
+          cd gitops-repo
+          git config user.name "CareSync CI Bot"
+          git config user.email "ci@caresync.com"
+          git add helm/
+          git commit -m "ci: update frontend image tag to ${{ needs.docker-build-trivy-push.outputs.image_tag }} [skip ci]"
+          
+          git push origin HEAD:${{ github.ref_name }}
