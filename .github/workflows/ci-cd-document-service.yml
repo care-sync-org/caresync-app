@@ -114,12 +114,25 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Generate Semantic Version
+        id: semver
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag_prefix: "v"
+          default_bump: patch
+          initial_version: "1.0.0"
+          dry_run: ${{ github.ref_name != 'main' }}
+
       - name: Set Image Tag
         id: set_tag
         run: |
-          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
-          ENV_NAME=${{ github.ref_name == 'main' && 'prod' || 'dev' }}
-          IMAGE_TAG="${ENV_NAME}-${SHORT_SHA}"
+          if [ "${{ github.ref_name }}" == "main" ]; then
+            IMAGE_TAG="${{ steps.semver.outputs.new_tag }}"
+          else
+            SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
+            IMAGE_TAG="${{ steps.semver.outputs.new_tag }}-dev-${SHORT_SHA}"
+          fi
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "Image tag: $IMAGE_TAG"
 
