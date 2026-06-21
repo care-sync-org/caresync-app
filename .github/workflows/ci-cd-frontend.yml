@@ -42,6 +42,38 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           projectBaseDir: frontend
+          args: >
+            -Dsonar.organization=care-sync-org
+            -Dsonar.projectKey=care-sync-org_caresync-frontend
+
+      - name: Send Failure Notification Email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ SonarCloud Failed: CareSync frontend"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            The SonarCloud scan job failed for the frontend.
+            Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+      - name: Send Success Notification Email
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "✅ SonarCloud Passed: CareSync frontend"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            The SonarCloud scan job completed successfully for the frontend.
 
   build-and-snyk:
     name: "Build and Snyk Scan"
@@ -69,6 +101,21 @@ jobs:
           command: test
           args: --severity-threshold=high --file=frontend/package.json
         continue-on-error: true
+
+      - name: Send Failure Notification Email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ Build/Scan Failed: CareSync frontend"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            The build or Snyk security scan job failed for the frontend.
+            Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
   docker-build-trivy-push:
     name: "Docker Build, Trivy Scan, and Push"
@@ -100,9 +147,12 @@ jobs:
         run: |
           aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build Docker Image locally for Trivy Scan
         run: |
-          docker build -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.set_tag.outputs.image_tag }} -f frontend/Dockerfile frontend
+          docker buildx build --platform linux/amd64 --load -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.set_tag.outputs.image_tag }} -f frontend/Dockerfile frontend
 
       - name: Run Trivy Vulnerability Scanner
         uses: aquasecurity/trivy-action@master
@@ -121,6 +171,37 @@ jobs:
           docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.set_tag.outputs.image_tag }} ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:latest
           docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:latest
 
+      - name: Send ECR Push Success Email
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "🐳 ECR Image Pushed: CareSync frontend"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            Successfully pushed frontend image to ECR.
+            Image Tag: ${{ steps.set_tag.outputs.image_tag }}
+            Registry: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}
+
+      - name: Send ECR Push Failure Email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ ECR Push Failed: CareSync frontend"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            Docker build & ECR push job failed for the frontend.
+            Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
   approval-gate:
     name: "Approval Gate (main only)"
     needs: docker-build-trivy-push
@@ -128,6 +209,23 @@ jobs:
     environment: production
     runs-on: ubuntu-latest
     steps:
+      - name: Send Approval Request Email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "🚀 Action Required: CareSync frontend Deploy Approval Needed"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            frontend image is ready for production deployment.
+            Image tag: ${{ needs.docker-build-trivy-push.outputs.image_tag }}
+            
+            This pipeline is waiting for your manual approval in GitHub Actions environment.
+            Approve at: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
       - name: Wait for Environment Approval
         run: echo "Deployment approved by manager in GitHub Actions!"
 
@@ -170,4 +268,24 @@ jobs:
           git add helm/
           git commit -m "ci: update frontend image tag to ${{ needs.docker-build-trivy-push.outputs.image_tag }} [skip ci]"
           
-          git push origin HEAD:${{ github.ref_name }}
+          for i in {1..5}; do
+            git pull --rebase origin ${{ github.ref_name }} && git push origin HEAD:${{ github.ref_name }} && exit 0
+            sleep 5
+          done
+          exit 1
+
+      - name: Send Helm Update Success Email
+        uses: dawidd6/action-send-mail@v3
+        if: success()
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "⛵ Helm Values Updated: CareSync frontend"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            The Helm values file has been updated with the new image tag.
+            ArgoCD will automatically detect this change and sync the deployment.
+            Image Tag: ${{ needs.docker-build-trivy-push.outputs.image_tag }}
