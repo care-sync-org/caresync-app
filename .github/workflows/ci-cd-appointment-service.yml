@@ -60,20 +60,6 @@ jobs:
           body: |
             The SonarCloud scan job failed for the appointment-service.
             Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            
-      - name: Send Success Notification Email
-        if: success()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 587
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "✅ SonarCloud Passed: CareSync appointment-service"
-          to: ${{ secrets.ALERT_EMAIL }}
-          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
-          body: |
-            The SonarCloud scan job completed successfully for the appointment-service.
 
   build-and-snyk:
     name: "Build and Snyk Scan"
@@ -170,22 +156,6 @@ jobs:
           docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.set_tag.outputs.image_tag }}
           docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.set_tag.outputs.image_tag }} ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:latest
           docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:latest
-
-      - name: Send ECR Push Success Email
-        if: success()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 587
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "🐳 ECR Image Pushed: CareSync appointment-service"
-          to: ${{ secrets.ALERT_EMAIL }}
-          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
-          body: |
-            Successfully pushed appointment-service image to ECR.
-            Image Tag: ${{ steps.set_tag.outputs.image_tag }}
-            Registry: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}
 
       - name: Send ECR Push Failure Email
         if: failure()
