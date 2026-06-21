@@ -217,6 +217,7 @@ jobs:
           repository: care-sync-org/caresync-gitops
           token: ${{ secrets.MANIFEST_REPO_PAT }}
           path: gitops-repo
+          ref: ${{ github.ref_name }}
 
       - name: Update Helm Values using yq
         run: |
