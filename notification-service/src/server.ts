@@ -57,3 +57,5 @@ async function start() {
 }
 
 start();
+
+// Trigger deployment for fresh ECR repositories
