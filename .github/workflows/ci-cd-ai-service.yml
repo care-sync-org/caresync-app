@@ -77,6 +77,8 @@ jobs:
       - name: Install Dependencies
         run: |
           cd ai-service
+          # Remove any stale shared/node_modules committed to the repo
+          rm -rf shared/node_modules
           npm ci
 
       - name: Snyk Security Scan
