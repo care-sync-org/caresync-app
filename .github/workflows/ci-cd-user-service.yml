@@ -2,7 +2,7 @@ name: "CareSync — user-service CI/CD"
 
 on:
   push:
-    branches: [dev, main]
+    branches: [main]
     paths:
       - 'user-service/**'
       - '.github/workflows/ci-cd-user-service.yml'
@@ -42,6 +42,24 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           projectBaseDir: user-service
+          args: >
+            -Dsonar.organization=care-sync-org
+            -Dsonar.projectKey=care-sync-org_caresync-user-service
+
+      - name: Send Failure Notification Email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ SonarCloud Failed: CareSync user-service"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            The SonarCloud scan job failed for the user-service.
+            Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
   build-and-snyk:
     name: "Build and Snyk Scan"
@@ -70,6 +88,21 @@ jobs:
           args: --severity-threshold=high --file=user-service/package.json
         continue-on-error: true
 
+      - name: Send Failure Notification Email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ Build/Scan Failed: CareSync user-service"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            The build or Snyk security scan job failed for the user-service.
+            Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
   docker-build-trivy-push:
     name: "Docker Build, Trivy Scan, and Push"
     needs: build-and-snyk
@@ -81,12 +114,25 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Generate Semantic Version
+        id: semver
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag_prefix: "v"
+          default_bump: patch
+          initial_version: "1.0.0"
+          dry_run: ${{ github.ref_name != 'main' }}
+
       - name: Set Image Tag
         id: set_tag
         run: |
-          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
-          ENV_NAME=${{ github.ref_name == 'main' && 'prod' || 'dev' }}
-          IMAGE_TAG="${ENV_NAME}-${SHORT_SHA}"
+          if [ "${{ github.ref_name }}" == "main" ]; then
+            IMAGE_TAG="${{ steps.semver.outputs.new_tag }}"
+          else
+            SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
+            IMAGE_TAG="${{ steps.semver.outputs.new_tag }}-prod-${SHORT_SHA}"
+          fi
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "Image tag: $IMAGE_TAG"
 
@@ -100,9 +146,12 @@ jobs:
         run: |
           aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build Docker Image locally for Trivy Scan
         run: |
-          docker build -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.set_tag.outputs.image_tag }} -f user-service/Dockerfile user-service
+          docker buildx build --platform linux/amd64 --load -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.set_tag.outputs.image_tag }} -f user-service/Dockerfile user-service
 
       - name: Run Trivy Vulnerability Scanner
         uses: aquasecurity/trivy-action@master
@@ -121,6 +170,21 @@ jobs:
           docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ steps.set_tag.outputs.image_tag }} ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:latest
           docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:latest
 
+      - name: Send ECR Push Failure Email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ ECR Push Failed: CareSync user-service"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            Docker build & ECR push job failed for the user-service.
+            Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
   approval-gate:
     name: "Approval Gate (main only)"
     needs: docker-build-trivy-push
@@ -128,6 +192,23 @@ jobs:
     environment: production
     runs-on: ubuntu-latest
     steps:
+      - name: Send Approval Request Email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "🚀 Action Required: CareSync user-service Deploy Approval Needed"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            user-service image is ready for production deployment.
+            Image tag: ${{ needs.docker-build-trivy-push.outputs.image_tag }}
+            
+            This pipeline is waiting for your manual approval in GitHub Actions environment.
+            Approve at: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
       - name: Wait for Environment Approval
         run: echo "Deployment approved by manager in GitHub Actions!"
 
@@ -138,8 +219,7 @@ jobs:
       always() &&
       needs.docker-build-trivy-push.result == 'success' &&
       (
-        github.ref_name == 'dev' ||
-        (github.ref_name == 'main' && needs.approval-gate.result == 'success')
+        github.ref_name == 'main' && needs.approval-gate.result == 'success'
       )
     runs-on: ubuntu-latest
     steps:
@@ -149,18 +229,13 @@ jobs:
           repository: care-sync-org/caresync-gitops
           token: ${{ secrets.MANIFEST_REPO_PAT }}
           path: gitops-repo
+          ref: ${{ github.ref_name }}
 
       - name: Update Helm Values using yq
         run: |
           cd gitops-repo
           
-          VALUES_FILE=${{ github.ref_name == 'main' && 'helm/values.yaml' || 'helm/values-dev.yaml' }}
-          
-          if [ "${{ github.ref_name }}" == "dev" ]; then
-            yq e '.services.userService.tag = "${{ needs.docker-build-trivy-push.outputs.image_tag }}"' -i helm/values-dev.yaml
-          else
-            yq e '.services.userService.tag = "${{ needs.docker-build-trivy-push.outputs.image_tag }}"' -i helm/values.yaml
-          fi
+          yq e '.services.userService.tag = "${{ needs.docker-build-trivy-push.outputs.image_tag }}"' -i helm/values-prod.yaml
 
       - name: Commit and Push Changes to GitOps Repo
         run: |
@@ -170,4 +245,24 @@ jobs:
           git add helm/
           git commit -m "ci: update user-service image tag to ${{ needs.docker-build-trivy-push.outputs.image_tag }} [skip ci]"
           
-          git push origin HEAD:${{ github.ref_name }}
+          for i in {1..5}; do
+            git pull --rebase origin main && git push origin HEAD:main && exit 0
+            sleep 5
+          done
+          exit 1
+
+      - name: Send Helm Update Success Email
+        uses: dawidd6/action-send-mail@v3
+        if: success()
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "⛵ Helm Values Updated: CareSync user-service"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            The Helm values file has been updated with the new image tag.
+            ArgoCD will automatically detect this change and sync the deployment.
+            Image Tag: ${{ needs.docker-build-trivy-push.outputs.image_tag }}

@@ -10,7 +10,7 @@ const app = express();
 app.use(cors({ origin: process.env.CORS_ORIGIN ?? '*' }));
 app.use(express.json());
 
-app.get('/api/health', (_req, res) => {
+app.get(['/api/health', '/api/ai/health'], (_req, res) => {
   res.status(200).json({
     status: 'healthy',
     service: 'ai-service',
@@ -52,3 +52,5 @@ async function start() {
 }
 
 start();
+
+// Trigger deployment for fresh ECR repositories

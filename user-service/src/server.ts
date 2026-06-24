@@ -21,7 +21,7 @@ app.use(cookieParser());
 app.use(express.json());
 app.use(morgan('combined'));
 
-app.get('/api/health', (_req, res) => {
+app.get(['/api/health', '/api/patients/health', '/api/doctors/health', '/api/admin/health'], (_req, res) => {
   res.status(200).json({
     status: 'healthy',
     service: 'user-service',
@@ -61,3 +61,5 @@ async function start() {
 }
 
 start();
+
+// Trigger deployment for fresh ECR repositories

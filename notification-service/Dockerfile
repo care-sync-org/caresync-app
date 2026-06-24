@@ -6,7 +6,7 @@ WORKDIR /app
 COPY package*.json ./
 COPY shared/package*.json ./shared/
 
-RUN npm install
+RUN npm ci
 
 COPY tsconfig.json ./
 COPY src/ ./src/
@@ -15,6 +15,7 @@ COPY shared/ ./shared/
 
 RUN apk add --no-cache openssl
 RUN npx --yes prisma generate --schema=./prisma/schema.prisma
+RUN rm -rf shared/node_modules/@prisma shared/node_modules/.prisma || true
 RUN npm run build --prefix shared
 RUN npm run build
 
@@ -28,7 +29,7 @@ RUN apk add --no-cache curl openssl
 COPY package*.json ./
 COPY shared/package*.json ./shared/
 
-RUN npm install --omit=dev
+RUN npm ci --omit=dev
 
 COPY --from=builder /app/prisma ./prisma
 RUN npx --yes prisma generate --schema=./prisma/schema.prisma
