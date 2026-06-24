@@ -24,7 +24,7 @@ FROM node:20-alpine AS production
 
 WORKDIR /app
 
-RUN apk add --no-cache curl openssl
+RUN apk update && apk upgrade --no-cache && apk add --no-cache curl openssl
 
 COPY package*.json ./
 COPY shared/package*.json ./shared/
