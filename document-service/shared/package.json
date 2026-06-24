@@ -1,6 +1,6 @@
 {
   "name": "@caresync/shared",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -32,3 +32,4 @@
     "typescript": "^5.7.2"
   }
 }
+
