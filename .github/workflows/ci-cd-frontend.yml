@@ -2,7 +2,7 @@ name: "CareSync — frontend CI/CD"
 
 on:
   push:
-    branches: [dev, main]
+    branches: [main]
     paths:
       - 'frontend/**'
       - '.github/workflows/ci-cd-frontend.yml'
@@ -131,7 +131,7 @@ jobs:
             IMAGE_TAG="${{ steps.semver.outputs.new_tag }}"
           else
             SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
-            IMAGE_TAG="${{ steps.semver.outputs.new_tag }}-dev-${SHORT_SHA}"
+            IMAGE_TAG="${{ steps.semver.outputs.new_tag }}-prod-${SHORT_SHA}"
           fi
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "Image tag: $IMAGE_TAG"
@@ -219,8 +219,7 @@ jobs:
       always() &&
       needs.docker-build-trivy-push.result == 'success' &&
       (
-        github.ref_name == 'dev' ||
-        (github.ref_name == 'main' && needs.approval-gate.result == 'success')
+        github.ref_name == 'main' && needs.approval-gate.result == 'success'
       )
     runs-on: ubuntu-latest
     steps:
@@ -236,13 +235,7 @@ jobs:
         run: |
           cd gitops-repo
           
-          VALUES_FILE=${{ github.ref_name == 'main' && 'helm/values.yaml' || 'helm/values-dev.yaml' }}
-          
-          if [ "${{ github.ref_name }}" == "dev" ]; then
-            yq e '.services.frontend.tag = "${{ needs.docker-build-trivy-push.outputs.image_tag }}"' -i helm/values-dev.yaml
-          else
-            yq e '.services.frontend.tag = "${{ needs.docker-build-trivy-push.outputs.image_tag }}"' -i helm/values.yaml
-          fi
+          yq e '.services.frontend.tag = "${{ needs.docker-build-trivy-push.outputs.image_tag }}"' -i helm/values-prod.yaml
 
       - name: Commit and Push Changes to GitOps Repo
         run: |
@@ -253,7 +246,7 @@ jobs:
           git commit -m "ci: update frontend image tag to ${{ needs.docker-build-trivy-push.outputs.image_tag }} [skip ci]"
           
           for i in {1..5}; do
-            git pull --rebase origin ${{ github.ref_name }} && git push origin HEAD:${{ github.ref_name }} && exit 0
+            git pull --rebase origin main && git push origin HEAD:main && exit 0
             sleep 5
           done
           exit 1
