@@ -30,7 +30,10 @@ RUN apk update && apk upgrade --no-cache && apk add --no-cache curl openssl
 COPY package*.json ./
 COPY shared/package*.json ./shared/
 
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev \
+    && npm cache clean --force \
+    && rm -rf /usr/local/lib/node_modules/npm \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx
 
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
