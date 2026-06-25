@@ -1,0 +1,396 @@
+name: "CareSync — Build (Lint, SAST, Scan & Push)"
+
+# ─── Triggers ─────────────────────────────────────────────────────────────────
+#
+# Branch strategy:
+#   main    — production gate. Push to main triggers this.
+#             ALWAYS builds ALL 7 services on main for consistent production SHA.
+#             After build, triggers deploy.yml targeting production (with approval gate).
+#   dev     — day-to-day work. Selective rebuild (only changed services).
+#             After build, triggers deploy.yml targeting dev (no approval required).
+#   PR → main — build + scan only (no push, no deploy). Status checks gate the merge.
+#
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'ai-service/**'
+      - 'appointment-service/**'
+      - 'auth-service/**'
+      - 'document-service/**'
+      - 'frontend/**'
+      - 'notification-service/**'
+      - 'user-service/**'
+      - '.github/workflows/build.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'ai-service/**'
+      - 'appointment-service/**'
+      - 'auth-service/**'
+      - 'document-service/**'
+      - 'frontend/**'
+      - 'notification-service/**'
+      - 'user-service/**'
+  workflow_dispatch:
+
+# ─── Permissions ──────────────────────────────────────────────────────────────
+permissions:
+  id-token: write    # OIDC → AWS (ECR push role assumption)
+  contents: write    # Required for mathieudutour/github-tag-action to create tags
+  actions: write     # Trigger deploy.yml via workflow_dispatch
+
+# Cancel in-progress builds on the same branch when a new push arrives.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 664685894054.dkr.ecr.us-east-1.amazonaws.com
+
+# ════════════════════════════════════════════════════════════════════════════
+# JOB 0: Detect which services changed
+#
+# On main / PR→main / workflow_dispatch: ALWAYS build all 7 services.
+# On dev: selective rebuild — only changed services.
+# ════════════════════════════════════════════════════════════════════════════
+jobs:
+  detect-changes:
+    name: "Detect Changed Services"
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      services_json: ${{ steps.set-matrix.outputs.services_json }}
+      deploy_env: ${{ steps.set-matrix.outputs.deploy_env }}
+      image_tag: ${{ steps.set-matrix.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect service path changes (dev branch only)
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            ai-service:
+              - 'ai-service/**'
+            appointment-service:
+              - 'appointment-service/**'
+            auth-service:
+              - 'auth-service/**'
+            document-service:
+              - 'document-service/**'
+            frontend:
+              - 'frontend/**'
+            notification-service:
+              - 'notification-service/**'
+            user-service:
+              - 'user-service/**'
+
+      - name: Build service matrix and set outputs
+        id: set-matrix
+        run: |
+          INCLUDE=()
+          SERVICES=()
+
+          # Each entry carries all per-service variables needed in the matrix job.
+          # sonar_key  — SonarCloud project key (care-sync-org_caresync-<service>)
+          # ecr_repo   — ECR repository path (caresync/<service>)
+          # helm_path  — yq path in values-prod.yaml for the image tag
+          # has_shared — "true" if the service has a shared/ directory requiring
+          #              `rm -rf shared/node_modules` before npm ci
+          add() {
+            local service="$1" ecr_repo="$2" sonar_key="$3" helm_path="$4" has_shared="$5"
+            INCLUDE+=("{\"service\":\"${service}\",\"ecr_repo\":\"${ecr_repo}\",\"sonar_key\":\"${sonar_key}\",\"helm_path\":\"${helm_path}\",\"has_shared\":\"${has_shared}\"}")
+            SERVICES+=("\"${service}\"")
+          }
+
+          all_services() {
+            add ai-service           caresync/ai-service           care-sync-org_caresync-ai-service           ".services.aiService.tag"           "true"
+            add appointment-service  caresync/appointment-service  care-sync-org_caresync-appointment-service  ".services.appointmentService.tag"  "false"
+            add auth-service         caresync/auth-service         care-sync-org_caresync-auth-service         ".services.authService.tag"         "false"
+            add document-service     caresync/document-service     care-sync-org_caresync-document-service     ".services.documentService.tag"     "true"
+            add frontend             caresync/frontend             care-sync-org_caresync-frontend             ".services.frontend.tag"            "false"
+            add notification-service caresync/notification-service care-sync-org_caresync-notification-service ".services.notificationService.tag" "false"
+            add user-service         caresync/user-service         care-sync-org_caresync-user-service         ".services.userService.tag"         "false"
+          }
+
+          # main / PR→main / manual trigger → always build all 7 (prod must be consistent SHA)
+          # dev → selective rebuild; fall back to all if nothing changed
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]] || \
+             [[ "${{ github.event_name }}" == "pull_request" ]] || \
+             [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "Building ALL services (main / PR→main / manual trigger)"
+            all_services
+          else
+            echo "dev push — selective rebuild"
+            [ "${{ steps.filter.outputs.ai-service }}"           = "true" ] && add ai-service           caresync/ai-service           care-sync-org_caresync-ai-service           ".services.aiService.tag"           "true"
+            [ "${{ steps.filter.outputs.appointment-service }}"  = "true" ] && add appointment-service  caresync/appointment-service  care-sync-org_caresync-appointment-service  ".services.appointmentService.tag"  "false"
+            [ "${{ steps.filter.outputs.auth-service }}"         = "true" ] && add auth-service         caresync/auth-service         care-sync-org_caresync-auth-service         ".services.authService.tag"         "false"
+            [ "${{ steps.filter.outputs.document-service }}"     = "true" ] && add document-service     caresync/document-service     care-sync-org_caresync-document-service     ".services.documentService.tag"     "true"
+            [ "${{ steps.filter.outputs.frontend }}"             = "true" ] && add frontend             caresync/frontend             care-sync-org_caresync-frontend             ".services.frontend.tag"            "false"
+            [ "${{ steps.filter.outputs.notification-service }}" = "true" ] && add notification-service caresync/notification-service care-sync-org_caresync-notification-service ".services.notificationService.tag" "false"
+            [ "${{ steps.filter.outputs.user-service }}"         = "true" ] && add user-service         caresync/user-service         care-sync-org_caresync-user-service         ".services.userService.tag"         "false"
+
+            # Nothing changed (e.g. only workflow file changed) — build all to validate CI
+            if [ ${#INCLUDE[@]} -eq 0 ]; then
+              echo "No service code changed — building all to validate CI config"
+              all_services
+            fi
+          fi
+
+          # Deployment target: main → prod (requires approval), dev → dev, PR → none
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            DEPLOY_ENV="prod"
+          elif [[ "${{ github.ref }}" == "refs/heads/dev" ]]; then
+            DEPLOY_ENV="dev"
+          else
+            DEPLOY_ENV="none"
+          fi
+
+          # Image tag: use git SHA for precise, immutable image references.
+          # This ensures every service in a release run shares the SAME tag,
+          # making deployment atomic and rollbacks straightforward.
+          IMAGE_TAG="${{ github.sha }}"
+          SHORT_SHA="${IMAGE_TAG:0:8}"
+
+          # On dev branch, prefix with "dev-" for easy identification in ECR
+          if [[ "$DEPLOY_ENV" == "dev" ]]; then
+            IMAGE_TAG="dev-${SHORT_SHA}"
+          fi
+
+          MATRIX_JSON=$(printf '%s,' "${INCLUDE[@]}" | sed 's/,$//')
+          SERVICES_JSON=$(printf '%s,' "${SERVICES[@]}" | sed 's/,$//')
+
+          echo "matrix={\"include\":[${MATRIX_JSON}]}" >> $GITHUB_OUTPUT
+          echo "services_json=[${SERVICES_JSON}]"      >> $GITHUB_OUTPUT
+          echo "deploy_env=${DEPLOY_ENV}"              >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}"                >> $GITHUB_OUTPUT
+
+          echo "Services to build: [${SERVICES_JSON}]"
+          echo "Deploy target: ${DEPLOY_ENV}"
+          echo "Image tag: ${IMAGE_TAG}"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 1: SonarCloud SAST — runs once per workflow (not per service)
+  # Scans each changed service directory independently using the matrix output.
+  # Skipped on PRs (SonarCloud analyses PRs separately via its own integration).
+  # ════════════════════════════════════════════════════════════════════════════
+  sonarcloud:
+    name: "SonarCloud Analysis — ${{ matrix.service }}"
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.detect-changes.outputs.matrix) }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for SonarCloud blame/diff analysis
+
+      - name: SonarCloud Scan — ${{ matrix.service }}
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: ${{ matrix.service }}
+          args: >
+            -Dsonar.organization=care-sync-org
+            -Dsonar.projectKey=${{ matrix.sonar_key }}
+
+      - name: Send Failure Notification Email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ SonarCloud Failed: CareSync ${{ matrix.service }}"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            The SonarCloud scan job failed for ${{ matrix.service }}.
+            Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 2: Snyk SCA — dependency vulnerability scan (per service, in parallel)
+  # Skipped on PRs.
+  # ════════════════════════════════════════════════════════════════════════════
+  snyk:
+    name: "Snyk Dependency Scan — ${{ matrix.service }}"
+    runs-on: ubuntu-latest
+    needs: [detect-changes, sonarcloud]
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.detect-changes.outputs.matrix) }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Dependencies
+        run: |
+          cd ${{ matrix.service }}
+          # ai-service and document-service have a shared/ directory with its own
+          # node_modules that can conflict with the root install. Remove it first.
+          if [ "${{ matrix.has_shared }}" = "true" ]; then
+            rm -rf shared/node_modules
+          fi
+          npm ci
+
+      - name: Snyk Security Scan — ${{ matrix.service }}
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: test
+          args: --severity-threshold=high --file=${{ matrix.service }}/package.json
+        continue-on-error: true
+
+      - name: Send Failure Notification Email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ Snyk Scan Failed: CareSync ${{ matrix.service }}"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            The Snyk security scan job failed for ${{ matrix.service }}.
+            Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 3: Docker Build, Trivy Scan, and ECR Push (per service, in parallel)
+  #
+  # On PRs:  Build image locally and run Trivy scan only — do NOT push to ECR.
+  # On push: Build, scan, and push to ECR with both SHA-based and 'latest' tags.
+  # ════════════════════════════════════════════════════════════════════════════
+  build-scan-push:
+    name: "Build, Scan & Push — ${{ matrix.service }}"
+    runs-on: ubuntu-latest
+    needs: [detect-changes, snyk]
+    if: always() && needs.detect-changes.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.detect-changes.outputs.matrix) }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        if: github.event_name != 'pull_request'
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Build Docker Image
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            -t ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ needs.detect-changes.outputs.image_tag }} \
+            -f ${{ matrix.service }}/Dockerfile \
+            ${{ matrix.service }}
+
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ needs.detect-changes.outputs.image_tag }}'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+        continue-on-error: true
+
+      - name: Push Docker Image to ECR
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ needs.detect-changes.outputs.image_tag }}
+          docker tag  ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ needs.detect-changes.outputs.image_tag }} \
+                      ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:latest
+          docker push ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:latest
+          echo "✅ Pushed ${{ matrix.service }} → ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ needs.detect-changes.outputs.image_tag }}"
+
+      - name: Send ECR Push Failure Email
+        if: failure() && github.event_name != 'pull_request'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ Build/Push Failed: CareSync ${{ matrix.service }}"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            Docker build or ECR push failed for ${{ matrix.service }}.
+            Image tag: ${{ needs.detect-changes.outputs.image_tag }}
+            Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 4: Trigger deploy pipeline
+  #
+  #   dev push  → deploy to dev (selective services, no approval)
+  #   main push → deploy to prod (all 7 services, requires approval gate)
+  #   PR        → no deploy (build/scan only)
+  # ════════════════════════════════════════════════════════════════════════════
+  trigger-deploy:
+    name: "Trigger Deploy (${{ needs.detect-changes.outputs.deploy_env }})"
+    runs-on: ubuntu-latest
+    needs: [detect-changes, build-scan-push]
+    if: |
+      github.event_name != 'pull_request' &&
+      needs.build-scan-push.result == 'success' &&
+      needs.detect-changes.outputs.deploy_env != 'none'
+    steps:
+      - name: Dispatch deploy.yml workflow
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const env      = '${{ needs.detect-changes.outputs.deploy_env }}';
+            const services = '${{ needs.detect-changes.outputs.services_json }}';
+            const imageTag = '${{ needs.detect-changes.outputs.image_tag }}';
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              workflow_id: 'deploy.yml',
+              ref:         context.ref,
+              inputs: {
+                image_tag:   imageTag,
+                environment: env,
+                services:    services
+              }
+            });
+
+            console.log(`✅ Deploy triggered for environment: ${env}`);
+            console.log(`ℹ️  Services: ${services}`);
+            console.log(`ℹ️  Image tag: ${imageTag}`);

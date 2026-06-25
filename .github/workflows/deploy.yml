@@ -1,0 +1,203 @@
+name: "CareSync — Deploy (Update Helm Tags & Sync ArgoCD)"
+
+# ─── Triggers ─────────────────────────────────────────────────────────────────
+# Triggered by build.yml dispatch OR manually with an image tag.
+# When triggered from main branch: requires production environment approval gate.
+# When triggered from dev branch: runs without approval (development environment).
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (e.g. abc12345 or dev-abc12345)'
+        required: true
+        default: ''
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, prod]
+      services:
+        description: 'JSON array of services to update, e.g. ["ai-service","frontend"]. Leave blank to update all.'
+        required: false
+        default: '["ai-service","appointment-service","auth-service","document-service","frontend","notification-service","user-service"]'
+
+# ─── Permissions ──────────────────────────────────────────────────────────────
+permissions:
+  id-token: write  # OIDC → AWS
+  contents: read
+
+# Serialise all GitOps repo writes to prevent concurrent git push conflicts.
+# Both dev (auto) and prod (after approval) share this group — only one push
+# to caresync-gitops happens at a time, eliminating the "fetch first" race.
+concurrency:
+  group: helm-push-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 664685894054.dkr.ecr.us-east-1.amazonaws.com
+  GITOPS_REPO: care-sync-org/caresync-gitops
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 1: Update image tags in caresync-gitops → ArgoCD auto-syncs
+  #
+  # The environment name maps as follows:
+  #   prod → "production" GitHub Environment (has Required Reviewers approval gate)
+  #   dev  → "development" GitHub Environment (no approval required)
+  #
+  # The yq paths in values-prod.yaml are the exact same paths used in the
+  # original 7 individual CI/CD workflows, preserving backward compatibility.
+  # ════════════════════════════════════════════════════════════════════════════
+  update-helm-tags:
+    name: "Update Helm Image Tags (${{ github.event.inputs.environment || 'dev' }})"
+    runs-on: ubuntu-latest
+    # This is the key line: when environment is "prod", GitHub will enforce the
+    # "Required Reviewers" protection rule on the "production" environment,
+    # pausing execution here and sending an approval notification.
+    environment: ${{ github.event.inputs.environment == 'prod' && 'production' || 'development' }}
+
+    steps:
+      - name: Send Approval Request Email (prod only)
+        if: github.event.inputs.environment == 'prod'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "🚀 Action Required: CareSync Production Deploy Approval Needed"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            All CareSync services are ready for production deployment.
+            Image tag: ${{ github.event.inputs.image_tag }}
+            Services: ${{ github.event.inputs.services }}
+
+            This pipeline is waiting for your manual approval in GitHub Actions.
+            Approve at: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Resolve GitOps branch
+        id: helm-branch
+        # prod values are tracked on the 'main' branch of caresync-gitops.
+        # dev values are tracked on the 'dev' branch of caresync-gitops.
+        run: |
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          if [ "$ENV" = "prod" ]; then
+            echo "branch=main" >> $GITHUB_OUTPUT
+          else
+            echo "branch=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout caresync-gitops repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ secrets.MANIFEST_REPO_PAT }}
+          ref: ${{ steps.helm-branch.outputs.branch }}
+          path: gitops-repo
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Update image tags in helm/values-prod.yaml
+        # Updates only the services listed in the 'services' input.
+        # Unchanged services retain their existing tag — ArgoCD will not restart them.
+        # The yq paths match exactly what was used in the original 7 individual workflows.
+        env:
+          SERVICES: ${{ github.event.inputs.services || '["ai-service","appointment-service","auth-service","document-service","frontend","notification-service","user-service"]' }}
+        run: |
+          IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          BASE="gitops-repo"
+          VALUES_FILE="${BASE}/helm/values-prod.yaml"
+
+          echo "Environment: $ENV"
+          echo "Image tag: $IMAGE_TAG"
+          echo "Services to update: $SERVICES"
+
+          # Map service name → yq path in values-prod.yaml
+          # This is the exact same mapping used in all 7 original workflows.
+          declare -A YQ_PATHS
+          YQ_PATHS["ai-service"]=".services.aiService.tag"
+          YQ_PATHS["appointment-service"]=".services.appointmentService.tag"
+          YQ_PATHS["auth-service"]=".services.authService.tag"
+          YQ_PATHS["document-service"]=".services.documentService.tag"
+          YQ_PATHS["frontend"]=".services.frontend.tag"
+          YQ_PATHS["notification-service"]=".services.notificationService.tag"
+          YQ_PATHS["user-service"]=".services.userService.tag"
+
+          echo "$SERVICES" | jq -r '.[]' | while read SERVICE; do
+            YQ_PATH="${YQ_PATHS[$SERVICE]}"
+            if [ -z "$YQ_PATH" ]; then
+              echo "⚠️  Unknown service: $SERVICE — skipping"
+              continue
+            fi
+            yq e "${YQ_PATH} = \"${IMAGE_TAG}\"" -i "${VALUES_FILE}"
+            echo "  ✅ ${SERVICE} → tag=${IMAGE_TAG}"
+          done
+
+          echo "✅ Helm values updated for environment: ${ENV}"
+
+      - name: Commit and push to caresync-gitops
+        run: |
+          HELM_BRANCH="${{ steps.helm-branch.outputs.branch }}"
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+          SHORT_TAG="${IMAGE_TAG:0:8}"
+
+          cd gitops-repo
+          git config user.name "CareSync CI Bot"
+          git config user.email "ci@caresync.com"
+          git add helm/
+
+          # Only commit if there are actual changes (idempotent — same tag re-deploy is a no-op)
+          if git diff --staged --quiet; then
+            echo "ℹ️  No changes to commit (image tags already up to date)"
+          else
+            git commit -m "deploy(${ENV}): update services to tag ${SHORT_TAG} [skip ci]"
+            # Pull --rebase guards against concurrent pushes to the same branch.
+            for i in {1..5}; do
+              git pull --rebase origin "${HELM_BRANCH}" && git push origin "${HELM_BRANCH}" && break
+              echo "Retry ${i}/5 after git conflict..."
+              sleep 5
+            done
+            echo "✅ Helm values committed on ${HELM_BRANCH} — ArgoCD will auto-sync within 3 minutes"
+          fi
+
+      - name: Send Helm Update Success Email
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "⛵ Helm Values Updated: CareSync (${{ github.event.inputs.environment || 'dev' }})"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            The Helm values file has been updated for the ${{ github.event.inputs.environment || 'dev' }} environment.
+            Image Tag: ${{ github.event.inputs.image_tag }}
+            Services: ${{ github.event.inputs.services }}
+            ArgoCD will automatically detect this change and sync the deployment.
+
+      - name: Send Helm Update Failure Email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ Deploy Failed: CareSync (${{ github.event.inputs.environment || 'dev' }})"
+          to: ${{ secrets.ALERT_EMAIL }}
+          from: CareSync CI/CD <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            The deployment pipeline failed for the ${{ github.event.inputs.environment || 'dev' }} environment.
+            Image Tag: ${{ github.event.inputs.image_tag }}
+            Check logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
