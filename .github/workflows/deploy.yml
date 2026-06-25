@@ -53,10 +53,13 @@ jobs:
   update-helm-tags:
     name: "Update Helm Image Tags (${{ github.event.inputs.environment || 'dev' }})"
     runs-on: ubuntu-latest
-    # This is the key line: when environment is "prod", GitHub will enforce the
-    # "Required Reviewers" protection rule on the "production" environment,
-    # pausing execution here and sending an approval notification.
-    environment: ${{ github.event.inputs.environment == 'prod' && 'production' || 'development' }}
+    # GitHub enforces the environment's protection rules here.
+    # The environment name matches the workflow input value directly:
+    #   'prod' → the 'prod' GitHub Environment (has Required Reviewers — approval gate)
+    #   'dev'  → the 'dev' GitHub Environment (no protection rules — auto-deploys)
+    # NOTE: Rename your GitHub environments from 'production'/'development' to 'prod'/'dev'
+    # in Settings → Environments to match these values.
+    environment: ${{ github.event.inputs.environment }}
 
     steps:
       - name: Send Approval Request Email (prod only)
