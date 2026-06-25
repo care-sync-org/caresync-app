@@ -63,11 +63,30 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       services_json: ${{ steps.set-matrix.outputs.services_json }}
       deploy_env: ${{ steps.set-matrix.outputs.deploy_env }}
-      image_tag: ${{ steps.set-matrix.outputs.image_tag }}
+      semantic_tag: ${{ steps.semver.outputs.new_tag }}
+      sha_tag: ${{ steps.sha.outputs.sha_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
+
+      - name: Generate SHA tag
+        id: sha
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "sha_tag=prod-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "SHA tag: prod-${SHORT_SHA}"
+
+      - name: Generate Semantic Version
+        id: semver
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag_prefix: "v"
+          default_bump: patch
+          initial_version: "1.0.0"
+          custom_release_rules: "feat:minor:Features,fix:patch:Fixes"
+          dry_run: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Detect service path changes (dev branch only)
         uses: dorny/paths-filter@v3
@@ -141,24 +160,11 @@ jobs:
             fi
           fi
 
-          # Deployment target: main → prod (requires approval), dev → dev, PR → none
+          # Deployment target: main → prod, dev/PR → none (we no longer deploy to dev)
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             DEPLOY_ENV="prod"
-          elif [[ "${{ github.ref }}" == "refs/heads/dev" ]]; then
-            DEPLOY_ENV="dev"
           else
             DEPLOY_ENV="none"
-          fi
-
-          # Image tag: use git SHA for precise, immutable image references.
-          # This ensures every service in a release run shares the SAME tag,
-          # making deployment atomic and rollbacks straightforward.
-          IMAGE_TAG="${{ github.sha }}"
-          SHORT_SHA="${IMAGE_TAG:0:8}"
-
-          # On dev branch, prefix with "dev-" for easy identification in ECR
-          if [[ "$DEPLOY_ENV" == "dev" ]]; then
-            IMAGE_TAG="dev-${SHORT_SHA}"
           fi
 
           MATRIX_JSON=$(printf '%s,' "${INCLUDE[@]}" | sed 's/,$//')
@@ -311,17 +317,23 @@ jobs:
 
       - name: Build Docker Image
         run: |
+          SEMANTIC_TAG="${{ needs.detect-changes.outputs.semantic_tag }}"
+          SHA_TAG="${{ needs.detect-changes.outputs.sha_tag }}"
+          ECR_IMAGE="${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}"
+          
           docker buildx build \
             --platform linux/amd64 \
             --load \
-            -t ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ needs.detect-changes.outputs.image_tag }} \
+            -t ${ECR_IMAGE}:${SEMANTIC_TAG} \
+            -t ${ECR_IMAGE}:${SHA_TAG} \
+            -t ${ECR_IMAGE}:latest \
             -f ${{ matrix.service }}/Dockerfile \
             ${{ matrix.service }}
 
       - name: Run Trivy Vulnerability Scanner
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: '${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ needs.detect-changes.outputs.image_tag }}'
+          image-ref: '${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ needs.detect-changes.outputs.sha_tag }}'
           format: 'table'
           exit-code: '1'
           ignore-unfixed: true
@@ -332,11 +344,14 @@ jobs:
       - name: Push Docker Image to ECR
         if: github.event_name != 'pull_request'
         run: |
-          docker push ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ needs.detect-changes.outputs.image_tag }}
-          docker tag  ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ needs.detect-changes.outputs.image_tag }} \
-                      ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:latest
-          docker push ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:latest
-          echo "✅ Pushed ${{ matrix.service }} → ${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}:${{ needs.detect-changes.outputs.image_tag }}"
+          SEMANTIC_TAG="${{ needs.detect-changes.outputs.semantic_tag }}"
+          SHA_TAG="${{ needs.detect-changes.outputs.sha_tag }}"
+          ECR_IMAGE="${{ env.ECR_REGISTRY }}/${{ matrix.ecr_repo }}"
+          
+          docker push ${ECR_IMAGE}:${SEMANTIC_TAG}
+          docker push ${ECR_IMAGE}:${SHA_TAG}
+          docker push ${ECR_IMAGE}:latest
+          echo "✅ Pushed ${{ matrix.service }} with tags: ${SEMANTIC_TAG}, ${SHA_TAG}, latest"
 
       - name: Send ECR Push Failure Email
         if: failure() && github.event_name != 'pull_request'
@@ -377,7 +392,8 @@ jobs:
           script: |
             const env      = '${{ needs.detect-changes.outputs.deploy_env }}';
             const services = '${{ needs.detect-changes.outputs.services_json }}';
-            const imageTag = '${{ needs.detect-changes.outputs.image_tag }}';
+            const semanticTag = '${{ needs.detect-changes.outputs.semantic_tag }}';
+            const shaTag   = '${{ needs.detect-changes.outputs.sha_tag }}';
 
             // createWorkflowDispatch requires a plain branch name ('main', 'dev'),
             // NOT the full ref ('refs/heads/dev') — strip the prefix.
@@ -389,12 +405,13 @@ jobs:
               workflow_id: 'deploy.yml',
               ref:         branch,
               inputs: {
-                image_tag:   imageTag,
-                environment: env,
-                services:    services
+                semantic_tag: semanticTag,
+                sha_tag:      shaTag,
+                environment:  env,
+                services:     services
               }
             });
 
             console.log(`✅ Deploy triggered for environment: ${env}`);
             console.log(`ℹ️  Services: ${services}`);
-            console.log(`ℹ️  Image tag: ${imageTag}`);
+            console.log(`ℹ️  Tags: ${semanticTag}, ${shaTag}`);
